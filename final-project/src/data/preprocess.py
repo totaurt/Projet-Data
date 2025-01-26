@@ -1,111 +1,83 @@
-import os
 import pandas as pd
-import numpy as np
-from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+import category_encoders as ce
+from sklearn.impute import SimpleImputer
+
+
+def impute_missing_values(data):
+    """
+    Handles missing values for both numeric and categorical columns.
+    """
+    # Separate numeric and categorical columns
+    numeric_cols = data.select_dtypes(include=['int64', 'float64']).columns
+    categorical_cols = data.select_dtypes(include=['object']).columns
+
+    # Define imputers for numeric and categorical columns
+    numeric_imputer = SimpleImputer(strategy='median')
+    categorical_imputer = SimpleImputer(strategy='most_frequent')
+
+    # Apply imputers
+    data[numeric_cols] = numeric_imputer.fit_transform(data[numeric_cols])
+    data[categorical_cols] = categorical_imputer.fit_transform(data[categorical_cols])
+
+    return data
+
 
 def load_and_clean_data(raw_data_path, preprocessed_path, train_path, test_path, test_size=0.2):
-    # Check if the preprocessed file exists
-    if os.path.exists(preprocessed_path):
-        print(f"Preprocessed data already exists at {preprocessed_path}. Skipping preprocessing.")
-        return pd.read_csv(preprocessed_path)  # Return the preprocessed data without processing
-
-    os.makedirs(os.path.dirname(preprocessed_path), exist_ok=True)
-    
-    # Load the dataset
-    print(f"Loading data from {raw_data_path}...")
+    # Load raw data
+    print("Loading raw data...")
     data = pd.read_csv(raw_data_path)
-    print(f"Data loaded successfully with {data.shape[0]} rows and {data.shape[1]} columns.")
     
-    data.stockout_indicator = data.stockout_indicator.astype(int)
-    data.holiday_indicator = data.holiday_indicator.astype(int)
-    data.promotion_applied = data.promotion_applied.astype(int)
+    # Drop unnecessary columns
+    print("Dropping unnecessary columns...")
+    columns_to_drop = ['transaction_id', 'forecasted_demand']
+    data = data.drop(columns=columns_to_drop, errors='ignore')
+
+    # Create new time-based features
+    print("Creating time-based features...")
+    data['transaction_month'] = pd.to_datetime(data['transaction_date']).dt.month
+    data['transaction_hour'] = pd.to_datetime(data['transaction_date']).dt.hour
+    data = data.drop('transaction_date', axis=1)
 
     # Handle missing values
     print("Handling missing values...")
-    for col in data.select_dtypes(include=[np.number]).columns:
-        data[col].fillna(data[col].mean(), inplace=True)
-    for col in data.select_dtypes(include=['object', 'category']).columns:
-        data[col].fillna(data[col].mode()[0], inplace=True)
+    data = impute_missing_values(data)
 
-    print("Handling outliers...")
-    for col in data.select_dtypes(include=[np.number]).columns:
-        Q1 = data[col].quantile(0.25)
-        Q3 = data[col].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        data[col] = np.clip(data[col], lower_bound, upper_bound)
-    
-    # Drop duplicates (if any)
-    print("Removing duplicates...")
-    data = data.drop_duplicates()
-    
-    # Convert date columns to datetime (if applicable)
-    print("Converting date columns to datetime...")
-    if 'date' in data.columns:
-        data['date'] = pd.to_datetime(data['date'])
-    
-    # Feature engineering (Example: Create a new feature based on existing ones)
-    print("Creating new features...")
-    if 'quantity_sold' in data.columns and 'unit_price' in data.columns:
-        data['total_revenue'] = data['quantity_sold'] * data['unit_price']
-    
-    if 'transaction_date' in data.columns:
-        data['transaction_date'] = pd.to_datetime(data['transaction_date'])
-        data['year'] = data['transaction_date'].dt.year
-        data['month'] = data['transaction_date'].dt.month
-        data['day_of_week'] = data['transaction_date'].dt.dayofweek 
-        
-    if 'inventory_level' in data.columns and 'reorder_point' in data.columns:
-        data['inventory_below_reorder'] = (data['inventory_level'] < data['reorder_point']).astype(int)
+    # One-Hot Encoding for low-cardinality features
+    print("Applying one-hot encoding...")
+    one_hot_columns = ['weekday', 'weather_conditions', 'payment_method', 'store_location', 
+                   'category', 'customer_gender', 'promotion_type']  # Added 'promotion_type'
+    data = pd.get_dummies(data, columns=one_hot_columns, drop_first=True)
 
-    print("Selecting features based on correlation...")
-    correlation_matrix = data.corr()
-    high_corr_features = [
-        column for column in correlation_matrix.columns
-        if any(abs(correlation_matrix[column]) > 0.9) and column != correlation_matrix.columns[0]
-    ]
-    print(f"Removing highly correlated features: {high_corr_features}")
-    data = data.drop(columns=high_corr_features)
+    # Target Encoding for high-cardinality features
+    print("Applying target encoding...")
+    target_encoding_columns = ['product_id', 'store_id', 'supplier_id', 'customer_id', 'product_name']  # Added 'product_name'
+    target_encoder = ce.TargetEncoder(cols=target_encoding_columns)
+    data[target_encoding_columns] = target_encoder.fit_transform(data[target_encoding_columns], data['actual_demand'])
 
-    print("Normalizing numerical columns...")
-    numerical_cols = data.select_dtypes(include=[np.number]).columns
-    scaler = StandardScaler()
-    data[numerical_cols] = scaler.fit_transform(data[numerical_cols])
-    
-    # One-Hot 
-    print("Applying One-Hot Encoding...")
-    data = pd.get_dummies(data, columns=['category', 'promotion_type'], drop_first=True)
 
+    # Encode ordinal columns
+    print("Applying ordinal encoding...")
+    ordinal_columns = ['customer_income', 'customer_loyalty_level']
+    label_encoder = ce.OrdinalEncoder(cols=ordinal_columns)
+    data[ordinal_columns] = label_encoder.fit_transform(data[ordinal_columns])
+
+    # Drop high-cardinality identifiers
+    columns_to_drop = ['customer_id', 'product_id', 'supplier_id']
+    data = data.drop(columns=columns_to_drop, errors='ignore')
     
-    print("Applying Ordinal Encoding...")
-    loyalty_mapping = {'Bronze': 1, 'Silver': 2, 'Gold': 3, 'Platinum': 4}
-    if 'customer_loyalty_level' in data.columns:
-        data['customer_loyalty_level'] = data['customer_loyalty_level'].map(loyalty_mapping)
-    
-    # Encoding categorical variables
-    print("Encoding categorical variables...")
-    categorical_cols = data.select_dtypes(include=['object', 'category']).columns
-    encoder = OrdinalEncoder()
-    data[categorical_cols] = encoder.fit_transform(data[categorical_cols])
-    
-    
-    # Save preprocessed data
-    preprocessed_data_path = preprocessed_path + "/preprocessed_data.csv"
-    print(f"Saving preprocessed data to {preprocessed_data_path}...")
-    data.to_csv(preprocessed_data_path, index=False)
-    print("Data saved successfully.")
-    
-    # Split data into training and test sets
-    print("Splitting data into training and test sets...")
+    # Split data into train and test sets
+    print("Splitting data into train and test sets...")
     train_data, test_data = train_test_split(data, test_size=test_size, random_state=42)
 
-    # Save training and test sets
-    print(f"Saving training data to {train_path}...")
+    # Save processed data
+    print("Saving processed data...")
     train_data.to_csv(train_path, index=False)
-    print(f"Saving test data to {test_path}...")
     test_data.to_csv(test_path, index=False)
 
-    print("Data split and saved successfully.")
+    print(f"Preprocessing complete. Train and test data saved at {train_path} and {test_path}")
     return train_data, test_data
+
+
+
